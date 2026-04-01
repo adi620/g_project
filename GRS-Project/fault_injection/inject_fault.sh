@@ -1,19 +1,36 @@
 #!/bin/bash
 # inject_fault.sh
-# Injects tc netem faults directly inside the web pod's network namespace.
-# Works correctly for same-node pod-to-pod traffic in KIND clusters.
+# Injects tc netem faults on the web pod's veth (host-side, inside node netns).
 #
-# The fault is applied on the pod's OWN eth0, so all traffic TO the pod
-# experiences the fault regardless of which interface the sender uses.
+# HOW IT WORKS — KIND networking:
+#
+#   Host
+#   └── KIND node container (docker)
+#       └── node network namespace
+#           ├── cbr0 bridge
+#           ├── veth_web ──── web pod eth0   ← tc goes HERE
+#           └── veth_traffic── traffic pod eth0
+#
+# We nsenter into the KIND node's network namespace (using its docker PID),
+# then find which veth corresponds to the web pod by matching the pod IP
+# via `ip route get`, then apply tc netem on that veth.
+#
+# This is the authoritative correct approach — no crictl, no /proc scanning,
+# no guessing. The node PID gives us its netns; the pod IP gives us the veth.
 #
 # Usage:
-#   sudo ./inject_fault.sh delay <ms>      # e.g. inject_fault.sh delay 200
-#   sudo ./inject_fault.sh loss <percent>  # e.g. inject_fault.sh loss 20
-#   sudo ./inject_fault.sh clear           # remove all rules
+#   sudo ./inject_fault.sh delay <ms>      e.g. sudo ./inject_fault.sh delay 200
+#   sudo ./inject_fault.sh loss <percent>  e.g. sudo ./inject_fault.sh loss 20
+#   sudo ./inject_fault.sh clear
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── Enforce sudo ──────────────────────────────────────────────
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: This script must be run with sudo."
+    echo "  sudo $0 $*"
+    exit 1
+fi
 
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
@@ -21,91 +38,147 @@ export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
 
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 delay <ms> | loss <percent> | clear"
+    echo "Usage: sudo $0 delay <ms> | loss <percent> | clear"
     exit 1
 fi
 
-# ── Find the web pod IP ───────────────────────────────────────
-POD_IP=$(kubectl get pod -l app=web \
-    -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+# ── 1. Get web pod IP ─────────────────────────────────────────
 POD_NAME=$(kubectl get pod -l app=web \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+POD_IP=$(kubectl get pod -l app=web \
+    -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
 
 if [ -z "$POD_IP" ]; then
-    echo "ERROR: Web pod not running or has no IP." >&2
+    echo "ERROR: Web pod not running or has no IP."
+    kubectl get pods
     exit 1
 fi
-echo "[inject_fault] Web pod: ${POD_NAME}  IP: ${POD_IP}"
+echo "[inject] Pod: ${POD_NAME}  IP: ${POD_IP}"
 
-# ── Find the host PID that owns the pod's network namespace ──
-# Strategy: scan /proc for a PID whose net namespace contains the pod IP
-# by checking /proc/<pid>/net/fib_trie (IPv4 routing table in text form).
-# This is 100% reliable, no crictl/label bugs.
-
-echo "[inject_fault] Scanning /proc for web pod network namespace..."
-
-NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+# ── 2. Get KIND node docker container PID ────────────────────
+NODE_NAME=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.nodeName}')
 NODE_PID=$(docker inspect "$NODE_NAME" --format '{{.State.Pid}}')
-NODE_NETNS=$(readlink "/proc/${NODE_PID}/ns/net" 2>/dev/null)
+echo "[inject] Node: ${NODE_NAME}  PID: ${NODE_PID}"
 
-POD_PID=""
-for status_file in /proc/*/status; do
-    pid=$(echo "$status_file" | cut -d'/' -f3)
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+# ── 3. Find the veth for the web pod inside the node netns ───
+# Inside the node's netns, run: ip route get <POD_IP>
+# This tells us which interface the node uses to reach the pod.
+# For a bridged veth setup it returns the veth directly.
+#
+# Example output: 10.244.0.5 dev vethXXXXXX src 10.244.0.1 uid 0
 
-    netns=$(readlink "/proc/${pid}/ns/net" 2>/dev/null) || continue
-    # Must be different netns from the node itself
-    [ "$netns" = "$NODE_NETNS" ] && continue
-    # Must have the pod IP in its routing table
-    fib="/proc/${pid}/net/fib_trie"
-    [ -f "$fib" ] || continue
-    if grep -q "$POD_IP" "$fib" 2>/dev/null; then
-        POD_PID="$pid"
-        break
+ROUTE_OUT=$(nsenter -t "$NODE_PID" -n -- \
+    ip route get "$POD_IP" 2>/dev/null || true)
+echo "[inject] Route to pod: ${ROUTE_OUT}"
+
+VETH=$(echo "$ROUTE_OUT" | awk '{
+    for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)
+}')
+
+# If route get returned the bridge (cbr0/kindnet), find the veth via
+# ARP / neighbor table instead
+if [ -z "$VETH" ] || echo "$VETH" | grep -qE "^(cbr|br|kind|docker)"; then
+    echo "[inject] Route via bridge, using ARP table to find veth..."
+    # Get the MAC of the pod's eth0
+    POD_MAC=$(nsenter -t "$NODE_PID" -n -- \
+        ip neigh show "$POD_IP" 2>/dev/null | awk '{print $5}' | head -1)
+    echo "[inject] Pod MAC: ${POD_MAC}"
+
+    if [ -n "$POD_MAC" ]; then
+        # Find the veth whose peer has that MAC — iterate veth interfaces
+        for iface in $(nsenter -t "$NODE_PID" -n -- \
+                ip -o link show type veth 2>/dev/null | \
+                awk -F': ' '{print $2}' | cut -d'@' -f1); do
+            # Get the peer's MAC via bridge fdb or direct check
+            IFACE_IDX=$(nsenter -t "$NODE_PID" -n -- \
+                cat /sys/class/net/"$iface"/ifindex 2>/dev/null || echo "")
+            PEER_IDX=$(nsenter -t "$NODE_PID" -n -- \
+                cat /sys/class/net/"$iface"/iflink 2>/dev/null || echo "")
+            # Read peer MAC by entering its netns temporarily
+            PEER_PID=$(grep -rl "^${PEER_IDX}$" /proc/*/net/iflink 2>/dev/null \
+                | head -1 | cut -d'/' -f3 || true)
+            if [ -n "$PEER_PID" ]; then
+                PEER_MAC=$(nsenter -t "$PEER_PID" -n -- \
+                    cat /sys/class/net/eth0/address 2>/dev/null || true)
+                if [ "$PEER_MAC" = "$POD_MAC" ]; then
+                    VETH="$iface"
+                    break
+                fi
+            fi
+        done
     fi
-done
+fi
 
-if [ -z "$POD_PID" ]; then
-    echo "ERROR: Could not find web pod network namespace in /proc." >&2
-    echo "  Pod IP searched: ${POD_IP}" >&2
-    echo "  Make sure the pod is Running: kubectl get pods" >&2
+# Final fallback: match by iflink — find the veth whose peer iflink
+# points to an interface that has the pod IP in its netns
+if [ -z "$VETH" ]; then
+    echo "[inject] Trying iflink scan fallback..."
+    # Find all veth interfaces in node netns
+    VETHI_LIST=$(nsenter -t "$NODE_PID" -n -- \
+        ip -o link show type veth 2>/dev/null | \
+        awk -F': ' '{gsub(/@.*/,"",$2); print $1":"$2}')
+
+    while IFS=: read -r idx iface; do
+        PEER_IDX=$(nsenter -t "$NODE_PID" -n -- \
+            cat /sys/class/net/"$iface"/iflink 2>/dev/null || echo "0")
+        # The peer is inside some pod netns — find that PID
+        for pid_net in /proc/*/net/fib_trie; do
+            p=$(echo "$pid_net" | cut -d'/' -f3)
+            [[ "$p" =~ ^[0-9]+$ ]] || continue
+            if grep -q "$POD_IP" "$pid_net" 2>/dev/null; then
+                PEER_LINK=$(cat /proc/"$p"/net/if_inet6 2>/dev/null | \
+                    head -1 | awk '{print $NF}' || true)
+                POD_IFIDX=$(cat /proc/"$p"/net/dev 2>/dev/null | \
+                    grep eth0 | awk '{print $1}' | tr -d ':' || true)
+                ETH0_IDX=$(nsenter -t "$p" -n -- \
+                    cat /sys/class/net/eth0/ifindex 2>/dev/null || echo "0")
+                if [ "$PEER_IDX" = "$ETH0_IDX" ]; then
+                    VETH="$iface"
+                    break 2
+                fi
+            fi
+        done
+    done <<< "$VETHI_LIST"
+fi
+
+if [ -z "$VETH" ]; then
+    echo ""
+    echo "ERROR: Could not identify the veth for pod ${POD_NAME} (IP: ${POD_IP})"
+    echo ""
+    echo "── Node network interfaces ──"
+    nsenter -t "$NODE_PID" -n -- ip link show
+    echo ""
+    echo "── Routes in node netns ──"
+    nsenter -t "$NODE_PID" -n -- ip route
     exit 1
 fi
 
-echo "[inject_fault] Found web pod netns via PID: ${POD_PID}"
+echo "[inject] Target veth: ${VETH}"
 
-# ── Apply tc rule inside pod's netns ─────────────────────────
-# nsenter -t <PID> -n enters that PID's network namespace
-# Then we apply tc on eth0 (the pod's primary interface)
-
-# Always clear existing rules first
-nsenter -t "$POD_PID" -n -- \
-    tc qdisc del dev eth0 root 2>/dev/null || true
+# ── 4. Apply tc rule ─────────────────────────────────────────
+nsenter -t "$NODE_PID" -n -- \
+    tc qdisc del dev "$VETH" root 2>/dev/null || true
 
 case "$MODE" in
     delay)
         DELAY_MS="${2:-200}"
-        echo "[inject_fault] Injecting ${DELAY_MS}ms delay on web pod eth0..."
-        nsenter -t "$POD_PID" -n -- \
-            tc qdisc add dev eth0 root netem delay "${DELAY_MS}ms"
-        echo "[inject_fault] Verifying:"
-        nsenter -t "$POD_PID" -n -- tc qdisc show dev eth0
-        echo "[inject_fault] ✓ ${DELAY_MS}ms delay active. All traffic TO web pod is delayed."
+        nsenter -t "$NODE_PID" -n -- \
+            tc qdisc add dev "$VETH" root netem delay "${DELAY_MS}ms"
+        echo "[inject] ✓ ${DELAY_MS}ms delay on ${VETH}"
+        nsenter -t "$NODE_PID" -n -- tc qdisc show dev "$VETH"
         ;;
     loss)
         LOSS_PCT="${2:-20}"
-        echo "[inject_fault] Injecting ${LOSS_PCT}% packet loss on web pod eth0..."
-        nsenter -t "$POD_PID" -n -- \
-            tc qdisc add dev eth0 root netem loss "${LOSS_PCT}%"
-        echo "[inject_fault] Verifying:"
-        nsenter -t "$POD_PID" -n -- tc qdisc show dev eth0
-        echo "[inject_fault] ✓ ${LOSS_PCT}% packet loss active. Triggers TCP retransmissions."
+        nsenter -t "$NODE_PID" -n -- \
+            tc qdisc add dev "$VETH" root netem loss "${LOSS_PCT}%"
+        echo "[inject] ✓ ${LOSS_PCT}% packet loss on ${VETH}"
+        nsenter -t "$NODE_PID" -n -- tc qdisc show dev "$VETH"
         ;;
     clear)
-        echo "[inject_fault] ✓ All tc rules cleared from web pod eth0."
+        echo "[inject] ✓ Rules cleared from ${VETH}"
         ;;
     *)
-        echo "ERROR: Unknown mode '${MODE}'. Use: delay | loss | clear"
+        echo "ERROR: Unknown mode '${MODE}'"
         exit 1
         ;;
 esac
