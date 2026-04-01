@@ -4,49 +4,68 @@
 # saves all outputs to results/, then cleans up.
 #
 # Usage: sudo ./run_full_pipeline.sh
-#   (sudo is needed for bpftrace and tc)
+#
+# KEY FIX: sudo drops the user's $HOME and $KUBECONFIG.
+# We detect the real user's kubeconfig and export it explicitly
+# so every kubectl call works correctly under sudo.
 
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="${PROJECT_ROOT}/results"
-EBPF_DIR="${PROJECT_ROOT}/ebpf"
-EXPERIMENTS_DIR="${PROJECT_ROOT}/experiments"
-DEPLOY_DIR="${PROJECT_ROOT}/deployment"
-TRAFFIC_DIR="${PROJECT_ROOT}/traffic"
+# ── RESOLVE REAL USER's KUBECONFIG (works under sudo) ────────
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
 
-# ── KIND CONTEXT: always point kubectl at the 'grs' cluster ──
+if [ ! -f "$KUBECONFIG" ]; then
+    echo "ERROR: kubeconfig not found at ${KUBECONFIG}"
+    echo "Run as the user who created the KIND cluster, or set KUBECONFIG manually."
+    exit 1
+fi
+echo "Using kubeconfig: ${KUBECONFIG}"
+
+# ── KIND CONTEXT ──────────────────────────────────────────────
 KIND_CLUSTER="${KIND_CLUSTER:-grs}"
 KIND_CONTEXT="kind-${KIND_CLUSTER}"
 
 echo "Setting kubectl context to: ${KIND_CONTEXT}"
 if ! kubectl config use-context "$KIND_CONTEXT" 2>/dev/null; then
-    echo "ERROR: Context '${KIND_CONTEXT}' not found."
-    echo "Available contexts:"
-    kubectl config get-contexts
     echo ""
-    echo "If your cluster has a different name, run:"
+    echo "ERROR: Context '${KIND_CONTEXT}' not found."
+    echo "Available contexts in ${KUBECONFIG}:"
+    kubectl config get-contexts 2>/dev/null || echo "(none)"
+    echo ""
+    echo "Fix: run with the correct cluster name:"
     echo "  KIND_CLUSTER=<name> sudo ./run_full_pipeline.sh"
+    echo ""
+    echo "Available KIND clusters:"
+    kind get clusters 2>/dev/null || echo "(kind not found)"
     exit 1
 fi
 
 # ── API SERVER HEALTH CHECK ───────────────────────────────────
 echo "Checking Kubernetes API server..."
 for i in 1 2 3 4 5; do
-    if kubectl cluster-info --context "$KIND_CONTEXT" &>/dev/null; then
+    if kubectl cluster-info &>/dev/null; then
         echo "API server is reachable."
         break
     fi
-    echo "  Attempt ${i}/5: API server not ready, waiting 5s..."
+    echo "  Attempt ${i}/5: not ready yet, waiting 5s..."
     sleep 5
     if [ "$i" -eq 5 ]; then
-        echo "ERROR: Kubernetes API server is not reachable after 25s."
-        echo "Make sure your KIND cluster is running:"
+        echo "ERROR: API server unreachable after 25s."
         echo "  kind get clusters"
         echo "  kind create cluster --name ${KIND_CLUSTER}"
         exit 1
     fi
 done
+
+# ── PATHS ─────────────────────────────────────────────────────
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${PROJECT_ROOT}/results"
+EBPF_DIR="${PROJECT_ROOT}/ebpf"
+EXPERIMENTS_DIR="${PROJECT_ROOT}/experiments"
+DEPLOY_DIR="${PROJECT_ROOT}/deployment"
+TRAFFIC_DIR="${PROJECT_ROOT}/traffic"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -55,10 +74,14 @@ exec > >(tee -a "$LOG") 2>&1
 
 echo "========================================================"
 echo " GRS eBPF Kubernetes Networking Pipeline"
-echo " Started: $(date)"
-echo " Cluster:  ${KIND_CLUSTER}"
-echo " Context:  ${KIND_CONTEXT}"
+echo " Started:    $(date)"
+echo " Cluster:    ${KIND_CLUSTER}"
+echo " Context:    ${KIND_CONTEXT}"
+echo " Kubeconfig: ${KUBECONFIG}"
 echo "========================================================"
+
+# Export so all child scripts inherit it
+export KUBECONFIG
 
 # ── 1. DEPLOY ────────────────────────────────────────────────
 echo ""
@@ -83,17 +106,15 @@ echo "Connectivity OK."
 # ── 3. START eBPF TRACING ────────────────────────────────────
 echo ""
 echo "── [3/6] Starting eBPF tracing (background) ──"
-sudo bpftrace "${EBPF_DIR}/tcp_retransmissions.bt" \
+bpftrace "${EBPF_DIR}/tcp_retransmissions.bt" \
     > "${RESULTS_DIR}/retransmissions.log" 2>&1 &
 RETRANS_PID=$!
 
-sudo bpftrace "${EBPF_DIR}/packet_drops.bt" \
+bpftrace "${EBPF_DIR}/packet_drops.bt" \
     > "${RESULTS_DIR}/packet_drops.log" 2>&1 &
 DROPS_PID=$!
 
 echo "eBPF tracing PIDs: retransmissions=${RETRANS_PID}, drops=${DROPS_PID}"
-
-# Give bpftrace time to attach probes
 sleep 3
 
 # ── 4. BASELINE ──────────────────────────────────────────────
@@ -114,8 +135,8 @@ bash "${EXPERIMENTS_DIR}/run_loss.sh"
 # ── CLEANUP ──────────────────────────────────────────────────
 echo ""
 echo "── Stopping eBPF tracing ──"
-sudo kill "$RETRANS_PID" 2>/dev/null || true
-sudo kill "$DROPS_PID"   2>/dev/null || true
+kill "$RETRANS_PID" 2>/dev/null || true
+kill "$DROPS_PID"   2>/dev/null || true
 wait "$RETRANS_PID" 2>/dev/null || true
 wait "$DROPS_PID"   2>/dev/null || true
 

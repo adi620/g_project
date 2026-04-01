@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+# Inherit kubeconfig from parent (sudo-safe)
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="${PROJECT_ROOT}/results"
