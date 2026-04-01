@@ -1,113 +1,136 @@
 #!/usr/bin/env python3
 """
-plot_results.py  —  Visualise GRS experiment results
-Reads baseline.csv, delay.csv, loss.csv from results/ and produces
-a side-by-side latency comparison chart.
+plot_results.py — GRS Experiment Visualiser
+Works with OR without matplotlib — falls back to ASCII chart if not available.
 
-Usage:
-    python3 plot_results.py [--results-dir ./results] [--out ./results/plot.png]
-
-Requirements:  pip install matplotlib pandas
+Usage:  python3 plot_results.py
 """
 
-import argparse
 import sys
+import csv
 from pathlib import Path
 
+RESULTS_DIR = Path(__file__).parent / "results"
+
+def load(name):
+    path = RESULTS_DIR / name
+    if not path.exists():
+        print(f"  WARNING: {name} not found")
+        return []
+    rows = []
+    with open(path) as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            try:
+                ts, lat = int(row[0]), float(row[1])
+                rows.append((ts, lat))
+            except (ValueError, IndexError):
+                continue
+    return rows
+
+def stats(data, label):
+    if not data:
+        return
+    lats = sorted(r[1] * 1000 for r in data)
+    n = len(lats)
+    mean = sum(lats) / n
+    median = lats[n // 2]
+    p95 = lats[int(n * 0.95)]
+    mx = lats[-1]
+    spikes = sum(1 for x in lats if x > 100)
+    print(f"  {label:15s}  n={n:3d}  mean={mean:8.2f}ms  "
+          f"median={median:8.2f}ms  p95={p95:8.1f}ms  "
+          f"max={mx:8.1f}ms  spikes(>100ms)={spikes}")
+
+b = load("baseline.csv")
+d = load("delay.csv")
+l = load("loss.csv")
+
+print("\n── GRS Experiment Results ──────────────────────────────")
+stats(b, "Baseline")
+stats(d, "200ms Delay")
+stats(l, "20% Loss")
+
+# ── Try matplotlib first ──────────────────────────────────────
 try:
-    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
-except ImportError:
-    print("Install deps: pip install matplotlib pandas")
-    sys.exit(1)
-
-
-def load(path: Path, label: str) -> pd.DataFrame:
-    if not path.exists():
-        print(f"  WARNING: {path.name} not found — skipping '{label}'.")
-        return pd.DataFrame()
-    df = pd.read_csv(path)
-    df.columns = ["ts_ms", "lat_s"]
-    df = df[df["lat_s"] != "timeout"].copy()
-    df["lat_s"] = pd.to_numeric(df["lat_s"], errors="coerce")
-    df = df.dropna(subset=["lat_s"])
-    df["elapsed_s"] = (df["ts_ms"] - df["ts_ms"].iloc[0]) / 1000.0
-    df["label"] = label
-    return df
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", default="results")
-    parser.add_argument("--out", default=None)
-    args = parser.parse_args()
-
-    rd = Path(args.results_dir)
-    out = Path(args.out) if args.out else rd / "latency_comparison.png"
-
-    datasets = {
-        "Baseline":    load(rd / "baseline.csv", "Baseline"),
-        "200ms Delay": load(rd / "delay.csv",    "200ms Delay"),
-        "20% Loss":    load(rd / "loss.csv",     "20% Loss"),
-    }
-
-    COLORS = {"Baseline": "#27ae60", "200ms Delay": "#e67e22", "20% Loss": "#e74c3c"}
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8),
                                     gridspec_kw={"height_ratios": [2.5, 1]})
-    fig.suptitle(
-        "Kubernetes eBPF Networking — Latency Under Fault Injection",
-        fontsize=13, fontweight="bold", y=0.98
-    )
+    fig.suptitle("GRS — Kubernetes eBPF Networking\n"
+                 "Latency: Baseline vs 200ms Delay vs 20% Packet Loss",
+                 fontsize=13, fontweight="bold")
 
-    box_data, box_labels = [], []
+    COLORS = {"Baseline":"#27ae60","200ms Delay":"#e67e22","20% Loss":"#e74c3c"}
 
-    for label, df in datasets.items():
-        if df.empty:
+    for data, lbl in [(b,"Baseline"),(d,"200ms Delay"),(l,"20% Loss")]:
+        if not data:
             continue
-        c = COLORS.get(label, "grey")
-        lat_ms = df["lat_s"] * 1000
-        ax1.plot(df["elapsed_s"], lat_ms,
-                 label=f"{label}  (mean={lat_ms.mean():.1f}ms)",
-                 color=c, linewidth=1.4, alpha=0.85)
-        box_data.append(lat_ms.values)
-        box_labels.append(label)
+        t0 = data[0][0]
+        xs = [(r[0]-t0)/1000 for r in data]
+        ys = [r[1]*1000 for r in data]
+        mean_ms = sum(ys)/len(ys)
+        ax1.plot(xs, ys, label=f"{lbl} (mean={mean_ms:.1f}ms)",
+                 color=COLORS[lbl], lw=1.5, marker="o", ms=3, alpha=0.85)
 
-    ax1.set_xlabel("Elapsed time (s)", fontsize=10)
-    ax1.set_ylabel("Latency (ms)", fontsize=10)
-    ax1.set_title("Latency over time per experiment", fontsize=11)
+    ax1.set_yscale("log")
+    ax1.yaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda x,_: f"{x:.0f}ms"))
+    ax1.set_xlabel("Elapsed (s)")
+    ax1.set_ylabel("Latency (ms) log scale")
+    ax1.set_title("Latency over time")
     ax1.legend(fontsize=9)
-    ax1.grid(True, linestyle="--", alpha=0.4)
-    ax1.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+    ax1.grid(True, ls="--", alpha=0.4)
 
-    if box_data:
-        bp = ax2.boxplot(box_data, labels=box_labels,
-                         patch_artist=True, notch=False, widths=0.4)
-        for patch, label in zip(bp["boxes"], box_labels):
-            patch.set_facecolor(COLORS.get(label, "grey"))
-            patch.set_alpha(0.65)
-    ax2.set_ylabel("Latency (ms)", fontsize=10)
-    ax2.set_title("Latency distribution (box plot)", fontsize=11)
-    ax2.grid(True, linestyle="--", alpha=0.4, axis="y")
+    box_data, box_labels, box_colors = [], [], []
+    for data, lbl in [(b,"Baseline"),(d,"200ms Delay"),(l,"20% Loss")]:
+        if data:
+            box_data.append([r[1]*1000 for r in data])
+            box_labels.append(lbl)
+            box_colors.append(COLORS[lbl])
+
+    bp = ax2.boxplot(box_data, tick_labels=box_labels,
+                     patch_artist=True, widths=0.4)
+    for patch, c in zip(bp["boxes"], box_colors):
+        patch.set_facecolor(c); patch.set_alpha(0.7)
+    ax2.set_ylabel("Latency (ms)")
+    ax2.set_title("Distribution")
+    ax2.grid(True, ls="--", alpha=0.4, axis="y")
 
     plt.tight_layout()
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / "latency_comparison.png"
+    RESULTS_DIR.mkdir(exist_ok=True)
     plt.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"\nPlot saved → {out}")
+    print(f"\n  Plot saved → {out}")
+    print("  View with:  feh results/latency_comparison.png")
+    print("         or:  eog results/latency_comparison.png")
+    print("         or:  xdg-open results/latency_comparison.png")
 
-    print("\n── Summary Statistics ─────────────────────────────")
-    for label, df in datasets.items():
-        if df.empty:
+except ImportError:
+    # ── ASCII fallback ────────────────────────────────────────
+    print("\n  matplotlib not installed — showing ASCII chart\n")
+    print("  (Install later: sudo apt install python3-matplotlib -y)\n")
+
+    WIDTH = 60
+    for data, lbl in [(b,"Baseline"),(d,"200ms Delay"),(l,"20% Loss")]:
+        if not data:
             continue
-        lat = df["lat_s"] * 1000
-        print(f"  {label:15s}  "
-              f"mean={lat.mean():7.2f}ms  "
-              f"median={lat.median():7.2f}ms  "
-              f"p95={lat.quantile(0.95):7.2f}ms  "
-              f"max={lat.max():7.2f}ms  "
-              f"n={len(lat)}")
+        lats = [r[1]*1000 for r in data]
+        mx = max(lats) if lats else 1
+        print(f"  {lbl}")
+        print(f"  {'─'*WIDTH}")
+        for i, v in enumerate(lats):
+            bar_len = int((v / mx) * WIDTH)
+            bar = "█" * bar_len
+            print(f"  {i+1:3d} │{bar:<{WIDTH}}│ {v:.1f}ms")
+        print()
 
-
-if __name__ == "__main__":
-    main()
+print("\n── How to read eBPF logs ───────────────────────────────")
+print("  cat results/retransmissions.log   # TCP retransmit events")
+print("  cat results/packet_drops.log      # Kernel drop events")
+print("  cat results/pipeline.log          # Full run history")
+print()

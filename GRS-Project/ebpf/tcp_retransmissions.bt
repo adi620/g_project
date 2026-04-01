@@ -1,7 +1,7 @@
 #!/usr/bin/env bpftrace
 // tcp_retransmissions.bt
 // Traces TCP retransmission events at the kernel level.
-// Each line = one retransmission event with timestamp and addresses.
+// Uses numeric AF_INET value (2) for older bpftrace compatibility.
 
 BEGIN
 {
@@ -13,11 +13,12 @@ BEGIN
 kprobe:tcp_retransmit_skb
 {
     $sk = (struct sock *)arg0;
-    if ($sk->__sk_common.skc_family == AF_INET) {
+    // AF_INET = 2
+    if ($sk->__sk_common.skc_family == 2) {
         printf("%-20lu %-16s %-6d %-16s RETRANSMIT\n",
             nsecs,
-            ntop(AF_INET, $sk->__sk_common.skc_rcv_saddr),
+            ntop(2, $sk->__sk_common.skc_rcv_saddr),
             (uint32)$sk->__sk_common.skc_num,
-            ntop(AF_INET, $sk->__sk_common.skc_daddr));
+            ntop(2, $sk->__sk_common.skc_daddr));
     }
 }
