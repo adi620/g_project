@@ -15,6 +15,39 @@ EXPERIMENTS_DIR="${PROJECT_ROOT}/experiments"
 DEPLOY_DIR="${PROJECT_ROOT}/deployment"
 TRAFFIC_DIR="${PROJECT_ROOT}/traffic"
 
+# ── KIND CONTEXT: always point kubectl at the 'grs' cluster ──
+KIND_CLUSTER="${KIND_CLUSTER:-grs}"
+KIND_CONTEXT="kind-${KIND_CLUSTER}"
+
+echo "Setting kubectl context to: ${KIND_CONTEXT}"
+if ! kubectl config use-context "$KIND_CONTEXT" 2>/dev/null; then
+    echo "ERROR: Context '${KIND_CONTEXT}' not found."
+    echo "Available contexts:"
+    kubectl config get-contexts
+    echo ""
+    echo "If your cluster has a different name, run:"
+    echo "  KIND_CLUSTER=<name> sudo ./run_full_pipeline.sh"
+    exit 1
+fi
+
+# ── API SERVER HEALTH CHECK ───────────────────────────────────
+echo "Checking Kubernetes API server..."
+for i in 1 2 3 4 5; do
+    if kubectl cluster-info --context "$KIND_CONTEXT" &>/dev/null; then
+        echo "API server is reachable."
+        break
+    fi
+    echo "  Attempt ${i}/5: API server not ready, waiting 5s..."
+    sleep 5
+    if [ "$i" -eq 5 ]; then
+        echo "ERROR: Kubernetes API server is not reachable after 25s."
+        echo "Make sure your KIND cluster is running:"
+        echo "  kind get clusters"
+        echo "  kind create cluster --name ${KIND_CLUSTER}"
+        exit 1
+    fi
+done
+
 mkdir -p "$RESULTS_DIR"
 
 LOG="${RESULTS_DIR}/pipeline.log"
@@ -23,14 +56,16 @@ exec > >(tee -a "$LOG") 2>&1
 echo "========================================================"
 echo " GRS eBPF Kubernetes Networking Pipeline"
 echo " Started: $(date)"
+echo " Cluster:  ${KIND_CLUSTER}"
+echo " Context:  ${KIND_CONTEXT}"
 echo "========================================================"
 
 # ── 1. DEPLOY ────────────────────────────────────────────────
 echo ""
 echo "── [1/6] Deploying Kubernetes workloads ──"
-kubectl apply -f "${DEPLOY_DIR}/web-deployment.yaml"
-kubectl apply -f "${DEPLOY_DIR}/web-service.yaml"
-kubectl apply -f "${TRAFFIC_DIR}/traffic.yaml"
+kubectl apply --validate=false -f "${DEPLOY_DIR}/web-deployment.yaml"
+kubectl apply --validate=false -f "${DEPLOY_DIR}/web-service.yaml"
+kubectl apply --validate=false -f "${TRAFFIC_DIR}/traffic.yaml"
 
 echo "Waiting for pods to be ready..."
 kubectl wait --for=condition=ready pod -l app=web --timeout=120s
