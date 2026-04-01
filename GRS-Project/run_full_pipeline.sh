@@ -69,8 +69,16 @@ echo "╚═══════════════════════�
 # ── STEP 1: DEPLOY ───────────────────────────────────────────
 echo ""
 echo "══ [1/7] Deploy workloads ════════════════════════════"
+
+# Deployment and Service can be applied normally (supports rolling update)
 kubectl apply --validate=false -f "${PROJECT_ROOT}/deployment/web-deployment.yaml"
 kubectl apply --validate=false -f "${PROJECT_ROOT}/deployment/web-service.yaml"
+
+# Pods (not Deployments) are immutable after creation — you cannot patch
+# spec.containers[*].command/args on a running pod.
+# Solution: always delete + recreate the traffic pod to pick up any changes.
+echo "Recreating traffic pod (pods are immutable, delete+create is required)..."
+kubectl delete pod traffic --ignore-not-found=true
 kubectl apply --validate=false -f "${PROJECT_ROOT}/traffic/traffic.yaml"
 
 echo "Waiting for pods to be Ready..."
