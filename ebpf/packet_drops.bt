@@ -1,0 +1,25 @@
+#!/usr/bin/env bpftrace
+// packet_drops.bt
+// Traces kernel packet drop events (kfree_skb).
+// Only logs drops with a non-zero reason (actual drops, not normal frees).
+// Run with: sudo bpftrace ebpf/packet_drops.bt
+
+BEGIN
+{
+    printf("%-20s %-20s %s\n", "TIME_NS", "LOCATION", "DROP_REASON");
+    printf("Tracing packet drops... Hit Ctrl-C to stop.\n");
+}
+
+kprobe:kfree_skb
+{
+    $skb  = (struct sk_buff *)arg0;
+    $reason = arg1;
+
+    // arg1 is drop reason; 0 = not a drop, just a normal free
+    if ($reason > 0) {
+        printf("%-20lu %-20s %d\n",
+            nsecs,
+            func,
+            (int32)$reason);
+    }
+}

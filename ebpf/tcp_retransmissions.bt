@@ -1,0 +1,26 @@
+#!/usr/bin/env bpftrace
+// tcp_retransmissions.bt
+// Traces TCP retransmission events at the kernel level.
+// Prints a timestamped line per retransmission event.
+// Run with: sudo bpftrace ebpf/tcp_retransmissions.bt
+
+BEGIN
+{
+    printf("%-20s %-20s %-6s %-6s %s\n",
+           "TIME_NS", "SADDR", "SPORT", "DPORT", "EVENT");
+    printf("Tracing TCP retransmissions... Hit Ctrl-C to stop.\n");
+}
+
+kprobe:tcp_retransmit_skb
+{
+    $sk = (struct sock *)arg0;
+    $inet_family = $sk->__sk_common.skc_family;
+
+    if ($inet_family == AF_INET) {
+        printf("%-20lu %-20s %-6d %-6d RETRANSMIT\n",
+            nsecs,
+            ntop(AF_INET, $sk->__sk_common.skc_rcv_saddr),
+            $sk->__sk_common.skc_num,
+            bswap16($sk->__sk_common.skc_dport));
+    }
+}
