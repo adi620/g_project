@@ -124,12 +124,12 @@ bash "${EXPERIMENTS_DIR}/run_baseline.sh"
 
 # ── 5. DELAY ─────────────────────────────────────────────────
 echo ""
-echo "── [5/6] Delay experiment (100ms) ──"
+echo "── [5/6] Delay experiment (200ms) ──"
 bash "${EXPERIMENTS_DIR}/run_delay.sh"
 
 # ── 6. PACKET LOSS ───────────────────────────────────────────
 echo ""
-echo "── [6/6] Packet loss experiment (10%) ──"
+echo "── [6/6] Packet loss experiment (20%) ──"
 bash "${EXPERIMENTS_DIR}/run_loss.sh"
 
 # ── CLEANUP ──────────────────────────────────────────────────

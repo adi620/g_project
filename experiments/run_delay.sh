@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="${PROJECT_ROOT}/results"
 DURATION="${DELAY_DURATION:-60}"
-DELAY_MS="${DELAY_MS:-100}"
+DELAY_MS="${DELAY_MS:-200}"
 
 mkdir -p "$RESULTS_DIR"
 

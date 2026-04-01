@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="${PROJECT_ROOT}/results"
 DURATION="${LOSS_DURATION:-60}"
-LOSS_PCT="${LOSS_PCT:-10}"
+LOSS_PCT="${LOSS_PCT:-20}"
 
 mkdir -p "$RESULTS_DIR"
 
