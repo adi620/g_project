@@ -1,11 +1,9 @@
 #!/bin/bash
 # experiments/run_loss.sh
-# Injects 10% packet loss, measures latency for 60s, then clears fault.
-# Output: results/loss.csv
+# Injects 20% packet loss on the web pod's eth0, measures 60s, clears fault.
 
 set -euo pipefail
 
-# Inherit kubeconfig from parent (sudo-safe)
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
@@ -20,20 +18,18 @@ mkdir -p "$RESULTS_DIR"
 
 echo "========================================"
 echo " PACKET LOSS EXPERIMENT"
-echo " Loss:     ${LOSS_PCT}%"
+echo " Loss:     ${LOSS_PCT}% on web pod eth0"
 echo " Duration: ${DURATION}s"
 echo " Output:   ${RESULTS_DIR}/loss.csv"
 echo "========================================"
 
-# Inject loss fault
-"${PROJECT_ROOT}/fault_injection/inject_loss.sh" "$LOSS_PCT"
+# Inject loss
+"${PROJECT_ROOT}/fault_injection/inject_fault.sh" loss "$LOSS_PCT"
 
-# Measure under fault
+# Cleanup on exit
+trap '"${PROJECT_ROOT}/fault_injection/inject_fault.sh" clear 2>/dev/null || true' EXIT
+
 bash "${PROJECT_ROOT}/measurement/measure_latency.sh" \
-    "${RESULTS_DIR}/loss.csv" \
-    "$DURATION"
+    "${RESULTS_DIR}/loss.csv" "$DURATION"
 
-# Always clean up
-"${PROJECT_ROOT}/fault_injection/clear_rules.sh"
-
-echo "[loss] Complete. Results in ${RESULTS_DIR}/loss.csv"
+echo "[loss] Done → ${RESULTS_DIR}/loss.csv"

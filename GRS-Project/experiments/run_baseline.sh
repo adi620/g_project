@@ -1,11 +1,9 @@
 #!/bin/bash
 # experiments/run_baseline.sh
-# Runs a 60-second baseline latency measurement with no faults injected.
-# Output: results/baseline.csv
+# 60-second baseline — no faults, clean latency measurement.
 
 set -euo pipefail
 
-# Inherit kubeconfig from parent (sudo-safe)
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
@@ -18,16 +16,15 @@ DURATION="${BASELINE_DURATION:-60}"
 mkdir -p "$RESULTS_DIR"
 
 echo "========================================"
-echo " BASELINE EXPERIMENT"
+echo " BASELINE EXPERIMENT (no faults)"
 echo " Duration: ${DURATION}s"
 echo " Output:   ${RESULTS_DIR}/baseline.csv"
 echo "========================================"
 
-# Ensure no leftover fault rules
-"${PROJECT_ROOT}/fault_injection/clear_rules.sh" 2>/dev/null || true
+# Ensure no leftover fault rules from previous runs
+"${PROJECT_ROOT}/fault_injection/inject_fault.sh" clear 2>/dev/null || true
 
 bash "${PROJECT_ROOT}/measurement/measure_latency.sh" \
-    "${RESULTS_DIR}/baseline.csv" \
-    "$DURATION"
+    "${RESULTS_DIR}/baseline.csv" "$DURATION"
 
-echo "[baseline] Complete. Results in ${RESULTS_DIR}/baseline.csv"
+echo "[baseline] Done → ${RESULTS_DIR}/baseline.csv"

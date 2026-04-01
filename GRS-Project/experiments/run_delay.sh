@@ -1,11 +1,9 @@
 #!/bin/bash
 # experiments/run_delay.sh
-# Injects 100ms network delay, measures latency for 60s, then clears fault.
-# Output: results/delay.csv
+# Injects 200ms delay on the web pod's eth0, measures 60s, clears fault.
 
 set -euo pipefail
 
-# Inherit kubeconfig from parent (sudo-safe)
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
@@ -20,20 +18,18 @@ mkdir -p "$RESULTS_DIR"
 
 echo "========================================"
 echo " DELAY EXPERIMENT"
-echo " Delay:    ${DELAY_MS}ms"
+echo " Delay:    ${DELAY_MS}ms on web pod eth0"
 echo " Duration: ${DURATION}s"
 echo " Output:   ${RESULTS_DIR}/delay.csv"
 echo "========================================"
 
-# Inject delay fault
-"${PROJECT_ROOT}/fault_injection/inject_delay.sh" "$DELAY_MS"
+# Inject delay
+"${PROJECT_ROOT}/fault_injection/inject_fault.sh" delay "$DELAY_MS"
 
-# Measure under fault
+# Measure under fault — cleanup runs even if measurement fails
+trap '"${PROJECT_ROOT}/fault_injection/inject_fault.sh" clear 2>/dev/null || true' EXIT
+
 bash "${PROJECT_ROOT}/measurement/measure_latency.sh" \
-    "${RESULTS_DIR}/delay.csv" \
-    "$DURATION"
+    "${RESULTS_DIR}/delay.csv" "$DURATION"
 
-# Always clean up, even on error
-"${PROJECT_ROOT}/fault_injection/clear_rules.sh"
-
-echo "[delay] Complete. Results in ${RESULTS_DIR}/delay.csv"
+echo "[delay] Done → ${RESULTS_DIR}/delay.csv"

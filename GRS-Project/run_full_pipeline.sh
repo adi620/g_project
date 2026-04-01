@@ -1,152 +1,175 @@
 #!/bin/bash
 # run_full_pipeline.sh
-# Master pipeline: deploys the system, runs all experiments with eBPF tracing,
-# saves all outputs to results/, then cleans up.
+# Complete experiment pipeline:
+#   Deploy → Baseline → Delay Fault → Loss Fault → Results
 #
 # Usage: sudo ./run_full_pipeline.sh
-#
-# KEY FIX: sudo drops the user's $HOME and $KUBECONFIG.
-# We detect the real user's kubeconfig and export it explicitly
-# so every kubectl call works correctly under sudo.
+# sudo is required for: bpftrace (eBPF), nsenter + tc (fault injection)
 
 set -euo pipefail
 
-# ── RESOLVE REAL USER's KUBECONFIG (works under sudo) ────────
+# ── SUDO-SAFE KUBECONFIG ──────────────────────────────────────
+# sudo resets $HOME to /root; we recover the real user's kubeconfig.
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 export KUBECONFIG="${KUBECONFIG:-${REAL_HOME}/.kube/config}"
 
 if [ ! -f "$KUBECONFIG" ]; then
     echo "ERROR: kubeconfig not found at ${KUBECONFIG}"
-    echo "Run as the user who created the KIND cluster, or set KUBECONFIG manually."
+    echo "Please run as the user who created the KIND cluster."
     exit 1
 fi
-echo "Using kubeconfig: ${KUBECONFIG}"
 
-# ── KIND CONTEXT ──────────────────────────────────────────────
+# ── SET KUBECTL CONTEXT ───────────────────────────────────────
 KIND_CLUSTER="${KIND_CLUSTER:-grs}"
 KIND_CONTEXT="kind-${KIND_CLUSTER}"
 
-echo "Setting kubectl context to: ${KIND_CONTEXT}"
+echo "Switching kubectl context → ${KIND_CONTEXT}"
 if ! kubectl config use-context "$KIND_CONTEXT" 2>/dev/null; then
-    echo ""
     echo "ERROR: Context '${KIND_CONTEXT}' not found."
-    echo "Available contexts in ${KUBECONFIG}:"
-    kubectl config get-contexts 2>/dev/null || echo "(none)"
-    echo ""
-    echo "Fix: run with the correct cluster name:"
-    echo "  KIND_CLUSTER=<name> sudo ./run_full_pipeline.sh"
+    echo "Available contexts:"
+    kubectl config get-contexts 2>/dev/null || true
     echo ""
     echo "Available KIND clusters:"
-    kind get clusters 2>/dev/null || echo "(kind not found)"
+    kind get clusters 2>/dev/null || true
+    echo ""
+    echo "Tip: KIND_CLUSTER=<name> sudo ./run_full_pipeline.sh"
     exit 1
 fi
 
-# ── API SERVER HEALTH CHECK ───────────────────────────────────
-echo "Checking Kubernetes API server..."
-for i in 1 2 3 4 5; do
+# ── VERIFY API SERVER ─────────────────────────────────────────
+echo "Verifying Kubernetes API server..."
+for i in $(seq 1 6); do
     if kubectl cluster-info &>/dev/null; then
-        echo "API server is reachable."
+        echo "✓ API server reachable."
         break
     fi
-    echo "  Attempt ${i}/5: not ready yet, waiting 5s..."
+    [ "$i" -eq 6 ] && { echo "ERROR: API server unreachable after 30s."; exit 1; }
+    echo "  Waiting... (attempt ${i}/6)"
     sleep 5
-    if [ "$i" -eq 5 ]; then
-        echo "ERROR: API server unreachable after 25s."
-        echo "  kind get clusters"
-        echo "  kind create cluster --name ${KIND_CLUSTER}"
-        exit 1
-    fi
 done
 
 # ── PATHS ─────────────────────────────────────────────────────
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="${PROJECT_ROOT}/results"
-EBPF_DIR="${PROJECT_ROOT}/ebpf"
-EXPERIMENTS_DIR="${PROJECT_ROOT}/experiments"
-DEPLOY_DIR="${PROJECT_ROOT}/deployment"
-TRAFFIC_DIR="${PROJECT_ROOT}/traffic"
+RESULTS="${PROJECT_ROOT}/results"
+mkdir -p "$RESULTS"
 
-mkdir -p "$RESULTS_DIR"
+# Log everything to file AND terminal
+exec > >(tee -a "${RESULTS}/pipeline.log") 2>&1
 
-LOG="${RESULTS_DIR}/pipeline.log"
-exec > >(tee -a "$LOG") 2>&1
-
-echo "========================================================"
-echo " GRS eBPF Kubernetes Networking Pipeline"
-echo " Started:    $(date)"
-echo " Cluster:    ${KIND_CLUSTER}"
-echo " Context:    ${KIND_CONTEXT}"
-echo " Kubeconfig: ${KUBECONFIG}"
-echo "========================================================"
-
-# Export so all child scripts inherit it
-export KUBECONFIG
-
-# ── 1. DEPLOY ────────────────────────────────────────────────
 echo ""
-echo "── [1/6] Deploying Kubernetes workloads ──"
-kubectl apply --validate=false -f "${DEPLOY_DIR}/web-deployment.yaml"
-kubectl apply --validate=false -f "${DEPLOY_DIR}/web-service.yaml"
-kubectl apply --validate=false -f "${TRAFFIC_DIR}/traffic.yaml"
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║   GRS — Kubernetes eBPF Networking Fault Diagnosis   ║"
+echo "╠══════════════════════════════════════════════════════╣"
+echo "║  Started:    $(date)"
+echo "║  Cluster:    ${KIND_CLUSTER}"
+echo "║  Kubeconfig: ${KUBECONFIG}"
+echo "╚══════════════════════════════════════════════════════╝"
 
-echo "Waiting for pods to be ready..."
-kubectl wait --for=condition=ready pod -l app=web --timeout=120s
-kubectl wait --for=condition=ready pod/traffic --timeout=120s
+# ── STEP 1: DEPLOY ───────────────────────────────────────────
+echo ""
+echo "══ [1/7] Deploy workloads ════════════════════════════"
+kubectl apply --validate=false -f "${PROJECT_ROOT}/deployment/web-deployment.yaml"
+kubectl apply --validate=false -f "${PROJECT_ROOT}/deployment/web-service.yaml"
+kubectl apply --validate=false -f "${PROJECT_ROOT}/traffic/traffic.yaml"
 
-echo "Pods ready:"
+echo "Waiting for pods to be Ready..."
+kubectl wait --for=condition=ready pod -l app=web  --timeout=120s
+kubectl wait --for=condition=ready pod/traffic      --timeout=120s
+
+echo ""
 kubectl get pods -o wide
-
-# ── 2. CONNECTIVITY CHECK ────────────────────────────────────
 echo ""
-echo "── [2/6] Connectivity check ──"
-kubectl exec traffic -- curl -s -o /dev/null -w "HTTP %{http_code}\n" web
-echo "Connectivity OK."
 
-# ── 3. START eBPF TRACING ────────────────────────────────────
+# ── STEP 2: CONNECTIVITY CHECK ───────────────────────────────
+echo "══ [2/7] Connectivity check ══════════════════════════"
+HTTP_CODE=$(kubectl exec traffic -- \
+    curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://web/ 2>/dev/null)
+if [ "$HTTP_CODE" = "200" ]; then
+    echo "✓ HTTP ${HTTP_CODE} — traffic pod can reach web pod."
+else
+    echo "ERROR: Expected HTTP 200 from web service, got: ${HTTP_CODE}"
+    exit 1
+fi
+
+# Show pod IPs for reference
+WEB_IP=$(kubectl get pod -l app=web -o jsonpath='{.items[0].status.podIP}')
+TRAFFIC_IP=$(kubectl get pod traffic -o jsonpath='{.status.podIP}')
+echo "  Web pod IP:     ${WEB_IP}"
+echo "  Traffic pod IP: ${TRAFFIC_IP}"
+
+# ── STEP 3: START eBPF TRACING ───────────────────────────────
 echo ""
-echo "── [3/6] Starting eBPF tracing (background) ──"
-bpftrace "${EBPF_DIR}/tcp_retransmissions.bt" \
-    > "${RESULTS_DIR}/retransmissions.log" 2>&1 &
+echo "══ [3/7] Start eBPF tracing (background) ════════════"
+bpftrace "${PROJECT_ROOT}/ebpf/tcp_retransmissions.bt" \
+    > "${RESULTS}/retransmissions.log" 2>&1 &
 RETRANS_PID=$!
 
-bpftrace "${EBPF_DIR}/packet_drops.bt" \
-    > "${RESULTS_DIR}/packet_drops.log" 2>&1 &
+bpftrace "${PROJECT_ROOT}/ebpf/packet_drops.bt" \
+    > "${RESULTS}/packet_drops.log" 2>&1 &
 DROPS_PID=$!
 
-echo "eBPF tracing PIDs: retransmissions=${RETRANS_PID}, drops=${DROPS_PID}"
+echo "  retransmissions tracer PID: ${RETRANS_PID}"
+echo "  packet_drops tracer PID:    ${DROPS_PID}"
+echo "  Waiting 3s for probes to attach..."
 sleep 3
 
-# ── 4. BASELINE ──────────────────────────────────────────────
-echo ""
-echo "── [4/6] Baseline experiment ──"
-bash "${EXPERIMENTS_DIR}/run_baseline.sh"
+# Cleanup eBPF on any exit
+cleanup_ebpf() {
+    echo ""
+    echo "Stopping eBPF tracers..."
+    kill "$RETRANS_PID" 2>/dev/null || true
+    kill "$DROPS_PID"   2>/dev/null || true
+    wait "$RETRANS_PID" 2>/dev/null || true
+    wait "$DROPS_PID"   2>/dev/null || true
+    echo "eBPF tracers stopped."
+}
+trap cleanup_ebpf EXIT
 
-# ── 5. DELAY ─────────────────────────────────────────────────
+# ── STEP 4: BASELINE ─────────────────────────────────────────
 echo ""
-echo "── [5/6] Delay experiment (200ms) ──"
-bash "${EXPERIMENTS_DIR}/run_delay.sh"
+echo "══ [4/7] Baseline experiment (60s, no faults) ════════"
+bash "${PROJECT_ROOT}/experiments/run_baseline.sh"
 
-# ── 6. PACKET LOSS ───────────────────────────────────────────
+# ── STEP 5: DELAY EXPERIMENT ─────────────────────────────────
 echo ""
-echo "── [6/6] Packet loss experiment (20%) ──"
-bash "${EXPERIMENTS_DIR}/run_loss.sh"
+echo "══ [5/7] Delay experiment (200ms, 60s) ═══════════════"
+bash "${PROJECT_ROOT}/experiments/run_delay.sh"
 
-# ── CLEANUP ──────────────────────────────────────────────────
+# ── STEP 6: PACKET LOSS EXPERIMENT ───────────────────────────
 echo ""
-echo "── Stopping eBPF tracing ──"
-kill "$RETRANS_PID" 2>/dev/null || true
-kill "$DROPS_PID"   2>/dev/null || true
-wait "$RETRANS_PID" 2>/dev/null || true
-wait "$DROPS_PID"   2>/dev/null || true
+echo "══ [6/7] Packet loss experiment (20%, 60s) ═══════════"
+bash "${PROJECT_ROOT}/experiments/run_loss.sh"
+
+# ── STEP 7: SUMMARY ──────────────────────────────────────────
+echo ""
+echo "══ [7/7] Results summary ═════════════════════════════"
+echo ""
+
+for csv in baseline delay loss; do
+    FILE="${RESULTS}/${csv}.csv"
+    if [ -f "$FILE" ]; then
+        COUNT=$(tail -n +2 "$FILE" | grep -v timeout | wc -l)
+        # Compute mean using awk
+        MEAN=$(tail -n +2 "$FILE" | grep -v timeout | \
+               awk -F',' '{s+=$2; n++} END {if(n>0) printf "%.4f", s/n; else print "N/A"}')
+        MAX=$(tail -n +2 "$FILE" | grep -v timeout | \
+              awk -F',' 'BEGIN{m=0} {if($2>m)m=$2} END{printf "%.4f", m}')
+        echo "  ${csv}.csv: ${COUNT} samples | mean=${MEAN}s | max=${MAX}s"
+    else
+        echo "  ${csv}.csv: NOT FOUND"
+    fi
+done
 
 echo ""
-echo "── Ensuring no residual tc rules ──"
-"${PROJECT_ROOT}/fault_injection/clear_rules.sh" 2>/dev/null || true
+echo "  eBPF logs:"
+echo "    Retransmissions: $(grep -c RETRANSMIT "${RESULTS}/retransmissions.log" 2>/dev/null || echo 0) events"
+echo "    Packet drops:    $(grep -v '^TIME\|^Tracing' "${RESULTS}/packet_drops.log" 2>/dev/null | grep -c '[0-9]' || echo 0) events"
 
 echo ""
-echo "========================================================"
-echo " Pipeline complete: $(date)"
-echo " Results saved in: ${RESULTS_DIR}/"
-ls -lh "${RESULTS_DIR}/"
-echo "========================================================"
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║  Pipeline complete: $(date)"
+echo "║  All results in: ${RESULTS}/"
+echo "╚══════════════════════════════════════════════════════╝"
+echo ""
+ls -lh "${RESULTS}/"
