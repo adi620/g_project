@@ -1,7 +1,6 @@
 #!/bin/bash
-# debug_network.sh
-# Tests fault injection end-to-end. Run this BEFORE the full pipeline.
-# Usage: sudo ./debug_network.sh
+# debug_network.sh — tests fault injection end-to-end before the full pipeline
+# Usage: sudo ./fault_injection/debug_network.sh
 
 set -euo pipefail
 
@@ -20,35 +19,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "════════════════════════════════════════"
 echo " Network Fault Injection Debug Tool"
 echo "════════════════════════════════════════"
-
 echo ""
 echo "── 1. Pod status ──"
 kubectl get pods -o wide
-
 echo ""
-echo "── 2. Baseline latency (no faults) ──"
+echo "── 2. Baseline latency (expect ~1-5ms) ──"
 for i in 1 2 3; do
     R=$(kubectl exec traffic -- curl -s -o /dev/null \
         -w "%{time_total}" --max-time 10 http://web/ 2>/dev/null)
     echo "  Request ${i}: ${R}s"
 done
-
 echo ""
 echo "── 3. Injecting 500ms delay ──"
 "${SCRIPT_DIR}/inject_fault.sh" delay 500
-
 echo ""
-echo "── 4. Latency WITH 500ms delay (expect ~0.5s+) ──"
+echo "── 4. Latency WITH 500ms delay (expect ~1.0s) ──"
 for i in 1 2 3; do
     R=$(kubectl exec traffic -- curl -s -o /dev/null \
         -w "%{time_total}" --max-time 15 http://web/ 2>/dev/null)
     echo "  Request ${i}: ${R}s"
 done
-
 echo ""
 echo "── 5. Clearing fault ──"
 "${SCRIPT_DIR}/inject_fault.sh" clear
-
 echo ""
 echo "── 6. Latency after clear (expect ~1-5ms) ──"
 for i in 1 2 3; do
@@ -56,9 +49,8 @@ for i in 1 2 3; do
         -w "%{time_total}" --max-time 10 http://web/ 2>/dev/null)
     echo "  Request ${i}: ${R}s"
 done
-
 echo ""
 echo "════ RESULT ════════════════════════════"
-echo "If step 4 showed ~0.5s → fault injection WORKING ✓"
-echo "If step 4 still showed ~0.001s → fault injection NOT working ✗"
+echo "Step 4 ~1.0s → injection WORKING ✓"
+echo "Step 4 ~0.001s → injection NOT working ✗"
 echo "════════════════════════════════════════"

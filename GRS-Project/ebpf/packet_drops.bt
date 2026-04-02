@@ -1,7 +1,7 @@
 #!/usr/bin/env bpftrace
 // packet_drops.bt
 // Traces kernel packet drop events via kfree_skb.
-// Uses numeric constants for older bpftrace compatibility.
+// reason > 1 = real drop (not a normal buffer free).
 
 BEGIN
 {
@@ -12,8 +12,12 @@ BEGIN
 kprobe:kfree_skb
 {
     $reason = (uint32)arg1;
-    // reason > 1 means an actual drop (not a normal free)
     if ($reason > 1) {
         printf("%-20lu %-30s %d\n", nsecs, func, $reason);
     }
+}
+
+END
+{
+    printf("\n[eBPF] packet_drops tracer stopped.\n");
 }
