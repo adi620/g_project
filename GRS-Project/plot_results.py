@@ -27,11 +27,22 @@ def load(name):
     path = RESULTS_DIR / name
     if not path.exists():
         return None
-    df = pd.read_csv(path)
+    # FIX: read_csv with on_bad_lines='skip' silently ignores malformed rows.
+    # usecols=[0,1] ensures we only take the first two columns regardless of
+    # how many columns the file has, preventing crashes on inconsistent CSVs.
+    try:
+        df = pd.read_csv(path, usecols=[0, 1], on_bad_lines="skip")
+    except TypeError:
+        # on_bad_lines added in pandas 1.3; older versions use error_bad_lines=False
+        df = pd.read_csv(path, usecols=[0, 1], error_bad_lines=False)
     df.columns = ["ts_ms", "lat_s"]
     df = df[df["lat_s"] != "timeout"].copy()
     df["lat_s"] = pd.to_numeric(df["lat_s"], errors="coerce")
     df = df.dropna(subset=["lat_s"])
+    if df.empty:
+        return None
+    df["ts_ms"] = pd.to_numeric(df["ts_ms"], errors="coerce")
+    df = df.dropna(subset=["ts_ms"])
     df["elapsed_s"] = (df["ts_ms"] - df["ts_ms"].iloc[0]) / 1000.0
     df["lat_ms"] = df["lat_s"] * 1000
     return df
@@ -77,8 +88,14 @@ for text in legend.get_texts():
     text.set_color("#c9d1d9")
 
 if box_data:
-    bp = ax2.boxplot(box_data, tick_labels=box_labels,
-                     patch_artist=True, notch=False, widths=0.4)
+    # FIX: tick_labels was added in matplotlib 3.9; use labels for older versions.
+    # Try tick_labels first (3.9+), fall back to labels (< 3.9) for compatibility.
+    try:
+        bp = ax2.boxplot(box_data, tick_labels=box_labels,
+                         patch_artist=True, notch=False, widths=0.4)
+    except TypeError:
+        bp = ax2.boxplot(box_data, labels=box_labels,
+                         patch_artist=True, notch=False, widths=0.4)
     for patch, c in zip(bp["boxes"], box_colors):
         patch.set_facecolor(c); patch.set_alpha(0.7)
     for elem in ["whiskers", "caps", "medians", "fliers"]:

@@ -1,19 +1,27 @@
 #!/usr/bin/env bpftrace
 // packet_drops.bt
-// Traces kernel packet drop events via kfree_skb.
-// reason > 1 = real drop (not a normal buffer free).
+// Traces kernel packet drop events.
+//
+// FIX: Replaced kprobe:kfree_skb (not traceable on many kernels) with
+//      tracepoint:skb:kfree_skb — a stable, named tracepoint available
+//      since kernel 4.19. Tracepoints are preferred over kprobes because
+//      they are part of the stable kernel ABI and cannot be inlined away.
 
 BEGIN
 {
-    printf("%-20s %-30s %s\n", "TIME_NS", "CALLER", "DROP_REASON");
-    printf("Tracing packet drops... Ctrl-C to stop.\n");
+    printf("%-20s %-20s %-10s %s\n", "TIME_NS", "LOCATION", "REASON_CODE", "EVENT");
+    printf("Tracing packet drops via tracepoint:skb:kfree_skb ... Ctrl-C to stop.\n");
 }
 
-kprobe:kfree_skb
+tracepoint:skb:kfree_skb
 {
-    $reason = (uint32)arg1;
-    if ($reason > 1) {
-        printf("%-20lu %-30s %d\n", nsecs, func, $reason);
+    // args->reason: drop reason code (0 = NOT_SPECIFIED, >1 = real drop)
+    // args->location: kernel function that called kfree_skb
+    if (args->reason > 1) {
+        printf("%-20lu %-20s %-10d DROP\n",
+            nsecs,
+            func,
+            args->reason);
     }
 }
 
